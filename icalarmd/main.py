@@ -2,10 +2,9 @@ import asyncio
 import aiofiles
 import os
 import subprocess
-from datetime import datetime
-from datetime import timedelta
+from datetime import datetime, timedelta
 
-from inotify import adapters
+from asyncinotify import Inotify, Mask
 from ics import Calendar
 
 
@@ -54,8 +53,8 @@ class AlarmFile:
     def __init__(self, path):
         # Set up a file watcher for this ICS file
         self.path = path
-        self.notifier = adapters.Inotify()
-        self.notifier.add_watch(self.path)
+        self.notifier = Inotify()
+        self.notifier.add_watch(self.path, Mask.CLOSE_WRITE)
 
         # Keep track of events/alarms to be triggered for this file
         self.alarms = []
@@ -107,9 +106,10 @@ class AlarmFile:
         await self.setup_alarms()
 
         # Loop through changes in the ICS file
-        for event in self.notifier.event_gen(yield_nones=False):
-            _, type_names, _, _ = event
-            print(type_names)
+        async for event in self.notifier:
+            print(event)
+            # _, type_names, _, _ = event
+            # print(type_names)
 
             # if 'IN_CLOSE' in type_names:
             #     self.clear_alarms()
