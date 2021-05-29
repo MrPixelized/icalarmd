@@ -3,8 +3,10 @@ import aiofiles
 import os
 import subprocess
 from datetime import datetime, timedelta
+from pathlib import Path
 
 from asyncinotify import Inotify, Mask
+from typing import Generator
 from ics import Calendar
 
 
@@ -43,26 +45,52 @@ class Notification:
     def notify(self):
         subprocess.run(['notify-send', self.title, self.details])
 
+    def __str__(self):
+        return f'''{self.title}; {self.details}'''
+
     def __call__(self):
         self.notify()
 
 
-"""AlarmFile; class that is responsible for watching a single
-ical file and triggering callbacks for events like alarms."""
-class AlarmFile:
-    def __init__(self, path):
-        # Set up a file watcher for this ICS file
+class IcalAlarmWatcher:
+    def __init__(self, path: Path):
         self.path = path
+        self.mask = Mask.MOVED_FROM  | \
+                    Mask.MOVED_TO    | \
+                    Mask.CREATE      | \
+                    Mask.DELETE_SELF | \
+                    Mask.IGNORED     | \
+                    Mask.CLOSE_WRITE
         self.notifier = Inotify()
-        self.notifier.add_watch(self.path, Mask.CLOSE_WRITE)
 
-        # Keep track of events/alarms to be triggered for this file
-        self.alarms = []
+        # Add listeners for the root directory and all of its children
+        self.add_listeners(self.path)
 
-    async def setup_alarms(self):
-        self.clear_alarms()
+    def add_listeners(self, path: Path):
+        """Add the required listeners for a directory and its children"""
+        self.notifier.add_watch(path, self.mask)
 
-        async with aiofiles.open(self.path, mode='r') as f:
+        for child in self.get_subdirs(path):
+            self.notifier.add_watch(child, self.mask)
+
+    async def listen(self):
+        """Listen for changes in files, making sure to track newly created
+        files and update the ICS alarms as changes come in"""
+
+        async for event in self.notifier:
+            # Listen for new dirs, and add listeners for them
+            if Mask.CREATE in event.mask and event.path.is_dir():
+                self.add_listeners(event.path)
+            
+            # A file changed, so regenerate the alarm queue
+            elif Mask.CLOSE_WRITE in event.mask and not event.path.is_dir():
+                await self.insert_alarm(event.path)
+
+    async def insert_alarm(self, path: Path):
+        """Insert the alarms given by the file at the specified path
+        into the alarm queue as a Notification object"""
+
+        async with aiofiles.open(path, mode='r') as f:
             content = await f.read()
 
         c = Calendar(content)
@@ -76,54 +104,36 @@ class AlarmFile:
                     title = "iCalendar alarm"
                     details = "Event happening soon"
 
-                notification = Notification(title, details)
-
                 # If the alarm trigger is a timedelta prior to start,
                 # convert it to an absolute time
                 if isinstance(alarm.trigger, timedelta):
-                    trigger = event.begin + alarm.trigger
+                    alarm_time = event.begin + alarm.trigger
                 else:
-                    trigger = alarm.trigger
+                    alarm_time = alarm.trigger
 
-                trigger = datetime.utcfromtimestamp(trigger.timestamp)
-                trigger = datetime.now() + timedelta(seconds=4)
-                trigger = Trigger(trigger, notification)
+                notification = Notification(title, details)
 
-                await trigger()
+                # Append this alarm to the queue
+                self.alarm_queue.append((alarm_time, notification))
+                print("Setup alarm", notification)
 
-                print('alarm setup')
+    @classmethod
+    def get_subdirs(cls, path: Path) -> Generator[Path, None, None]:
+        """Recursively list all directories under path"""
 
-                # Set the notification to trigger at the right time
-                self.alarms.append(trigger)
+        if not path.is_dir():
+            return
 
-    def clear_alarms(self):
-        for alarm in self.alarms:
-            alarm.cancel()
-            del alarm
-
-    async def listen(self):
-        # Set up alarms on start of listen
-        await self.setup_alarms()
-
-        # Loop through changes in the ICS file
-        async for event in self.notifier:
-            print(event)
-            # _, type_names, _, _ = event
-            # print(type_names)
-
-            # if 'IN_CLOSE' in type_names:
-            #     self.clear_alarms()
-            #     return
-
-            await self.setup_alarms()
-
+        for child in path.iterdir():
+            yield from cls.get_subdirs(child)
 
 
 async def main():
-    path = os.path.abspath('./test.ics')
-    f = AlarmFile(path)
+    path = Path(os.path.abspath('./test'))
+    f = IcalAlarmWatcher(path)
 
     await f.listen()
+
 
 if __name__ == '__main__':
     loop = asyncio.get_event_loop()
