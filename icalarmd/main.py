@@ -10,8 +10,7 @@ from typing import Generator
 from ics import Calendar
 
 
-"""Class that asynchronously triggers a function at or after a given time,
-cancelable"""
+"""Asynchronously triggers a function at or after a given time, cancelable"""
 class Trigger:
     def __init__(self, timestamp: datetime, callback: callable):
         self.callback = callback
@@ -19,8 +18,8 @@ class Trigger:
 
         self.task = asyncio.create_task(self._trigger())
 
-    async def __call__(self):
-        await self.task
+    def __call__(self):
+        asyncio.ensure_future(self.task)
 
     def cancel(self):
         self.task.cancel()
@@ -36,6 +35,7 @@ class Trigger:
         self.callback()
 
 
+"""Represents a notification that can be displayed to the system"""
 class Notification:
     def __init__(self, title: str, details: str):
         self.title = title
@@ -51,6 +51,8 @@ class Notification:
         self.notify()
 
 
+"""Watches a directory for changes in ical files and automatically triggers
+notifications based on the alarm settings in the files"""
 class IcalAlarmWatcher:
     def __init__(self, path: Path):
         self.path = path
@@ -68,10 +70,14 @@ class IcalAlarmWatcher:
         self.alarm_queue = []
         self.trigger = None
 
-        # Add listeners for the root directory and all of its children
-        self.add_listeners(self.path)
+    async def init_alarms(self, path: Path):
+        """Add the alarms for all of the ics files under path (recursively)
+        to the alarm queue"""
+        for path in (*self.get_subdirs(path), path):
+            for ics in path.glob('*.ics'):
+                await self.insert_alarm(ics)
 
-    def add_listeners(self, path: Path):
+    async def add_listeners(self, path: Path):
         """Add the required listeners for a directory and its children"""
         self.notifier.add_watch(path, self.mask)
 
@@ -81,16 +87,26 @@ class IcalAlarmWatcher:
     async def listen(self):
         """Listen for changes in files, making sure to track newly created
         files and update the ICS alarms as changes come in"""
+        # Add listeners for the root directory and all of its children
+        await self.init_alarms(self.path)
+        await self.add_listeners(self.path)
+
+        # Prime the first alarm to trigger a notification
+        self.prime()
+
+        # Loop through the inotify listeners to check for changes to files
         async for event in self.notifier:
             # Listen for new dirs, and add listeners for them
             if Mask.CREATE in event.mask and event.path.is_dir():
-                self.add_listeners(event.path)
+                await self.init_alarms(event.path)
+                await self.add_listeners(event.path)
+                self.prime()
             
             # A file changed, so regenerate the alarm queue and trigger
             # the new 'next alarm'
             elif Mask.CLOSE_WRITE in event.mask and not event.path.is_dir():
                 await self.insert_alarm(event.path)
-                await self.prime()
+                self.prime()
 
     async def insert_alarm(self, path: Path):
         """Insert the alarms given by the file at the specified path
@@ -120,10 +136,9 @@ class IcalAlarmWatcher:
                 notification = Notification(title, details)
                 self.alarm_queue.append((alarm_time, notification))
 
-    async def prime(self):
+    def prime(self):
         """Clear any alarm triggers already in memory, and use the most recent
         alarm in the alarm_queue to setup a new notification event"""
-
         # Cancel the current alarm so the new one can be triggered on its own
         if self.trigger is not None:
             self.trigger.cancel()
@@ -141,14 +156,15 @@ class IcalAlarmWatcher:
 
         # Small function that triggers the notification for an alarm,
         # and then clears it from the queue
-        def _notify_and_clear():
+        def _notify_and_pop():
             notification.notify()
             self.alarm_queue.pop()
 
-        print('Setup alarm:', notification, '@', timestamp)
+        print(f'Setup alarm!\n\t{notification} @ {timestamp}')
+        print('Queue:\n\t' + '\n\t'.join(map(lambda x: str(x[1]) + ' @ ' + str(x[0]), self.alarm_queue)))
 
-        self.trigger = Trigger(timestamp, notification.notify)
-        await self.trigger()
+        self.trigger = Trigger(timestamp, _notify_and_pop)
+        self.trigger()
 
     @classmethod
     def get_subdirs(cls, path: Path) -> Generator[Path, None, None]:
