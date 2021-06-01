@@ -2,6 +2,7 @@ import asyncio
 import aiofiles
 import os
 import subprocess
+from bisect import insort
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -50,6 +51,9 @@ class Notification:
     def __call__(self):
         self.notify()
 
+    def __lt__(self, other):
+        return True
+
 
 """Watches a directory for changes in ical files and automatically triggers
 notifications based on the alarm settings in the files"""
@@ -71,11 +75,10 @@ class IcalAlarmWatcher:
         self.trigger = None
 
     async def init_alarms(self, path: Path):
-        """Add the alarms for all of the ics files under path (recursively)
-        to the alarm queue"""
-        for path in (*self.get_subdirs(path), path):
-            for ics in path.glob('*.ics'):
-                await self.insert_alarm(ics)
+        """Add the alarms for all of the ics files under a directory
+        (recursively) to the alarm queue"""
+        for ics in path.glob('**/*.ics'):
+            await self.insert_alarm(ics)
 
     async def add_listeners(self, path: Path):
         """Add the required listeners for a directory and its children"""
@@ -104,24 +107,43 @@ class IcalAlarmWatcher:
             
             # A file changed, so regenerate the alarm queue and trigger
             # the new 'next alarm'
-            elif Mask.CLOSE_WRITE in event.mask and not event.path.is_dir():
+            elif not event.path.is_dir():
                 await self.insert_alarm(event.path)
                 self.prime()
 
     async def insert_alarm(self, path: Path):
         """Insert the alarms given by the file at the specified path
         into the alarm queue as a Notification object"""
-        async with aiofiles.open(path, mode='r') as f:
-            content = await f.read()
+        # Remove old alarms related to this file from the queue
+        self.alarm_queue = list(
+                filter(lambda x: x[-1] != path, self.alarm_queue))
 
-        c = Calendar(content)
+        # Read content from the file
+        try:
+            async with aiofiles.open(path, mode='r') as f:
+                content = await f.read()
+        except FileNotFoundError:
+            return
 
+        print(path)
+        print(content)
+
+        # Parse the content into a calendar
+        try:
+            c = Calendar(content)
+        except NotImplementedError:
+            # TODO: Make sure this handles multiple calendars in a single file
+            return
+
+        # Loop trough the alarms in the calendar
         for event in c.events:
             for alarm in event.alarms:
-                try:
-                    title, details = event.description.split('\n', 1)
-                except AttributeError:
+                title = event.name
+                details = event.description
+
+                if not title:
                     title = "iCalendar alarm"
+                if not details:
                     details = "Event happening soon"
 
                 # If the alarm trigger is a timedelta prior to start,
@@ -134,7 +156,7 @@ class IcalAlarmWatcher:
                 # Append this alarm to the queue
                 alarm_time = datetime.fromtimestamp(alarm_time.timestamp)
                 notification = Notification(title, details)
-                self.alarm_queue.append((alarm_time, notification))
+                insort(self.alarm_queue, (alarm_time, notification, path))
 
     def prime(self):
         """Clear any alarm triggers already in memory, and use the most recent
@@ -152,7 +174,7 @@ class IcalAlarmWatcher:
             return
 
         # Obtain the data of the next alarm to be triggered
-        (timestamp, notification) = self.alarm_queue[-1]
+        (timestamp, notification, path) = self.alarm_queue[-1]
 
         # Small function that triggers the notification for an alarm,
         # and then clears it from the queue
@@ -160,24 +182,26 @@ class IcalAlarmWatcher:
             notification.notify()
             self.alarm_queue.pop()
 
-        print(f'Setup alarm!\n\t{notification} @ {timestamp}')
-        print('Queue:\n\t' + '\n\t'.join(map(lambda x: str(x[1]) + ' @ ' + str(x[0]), self.alarm_queue)))
-
         self.trigger = Trigger(timestamp, _notify_and_pop)
         self.trigger()
+
+        print(f'Setup alarm!\n\t{notification} @ {timestamp}')
+        print('Queue:\n\t' + '\n\t'.join(
+            map(lambda x: str(x[1]) + ' @ ' + str(x[0]), self.alarm_queue))
+        )
 
     @classmethod
     def get_subdirs(cls, path: Path) -> Generator[Path, None, None]:
         """Recursively list all directories under path"""
-        if not path.is_dir():
-            return
-
         for child in path.iterdir():
-            yield from cls.get_subdirs(child)
+            if child.is_dir():
+                print(child)
+                yield child
+                yield from cls.get_subdirs(child)
 
 
 async def main():
-    path = Path(os.path.abspath('./test'))
+    path = Path(os.path.abspath('/home/ischa/.local/share/caldav'))
     f = IcalAlarmWatcher(path)
 
     await f.listen()
