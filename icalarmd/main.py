@@ -2,7 +2,7 @@ import asyncio
 import aiofiles
 import os
 import subprocess
-from bisect import insort
+import heapq
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -125,9 +125,6 @@ class IcalAlarmWatcher:
         except FileNotFoundError:
             return
 
-        print(path)
-        print(content)
-
         # Parse the content into a calendar
         try:
             c = Calendar(content)
@@ -156,7 +153,7 @@ class IcalAlarmWatcher:
                 # Append this alarm to the queue
                 alarm_time = datetime.fromtimestamp(alarm_time.timestamp)
                 notification = Notification(title, details)
-                insort(self.alarm_queue, (alarm_time, notification, path))
+                heapq.heappush(self.alarm_queue, (alarm_time, notification, path))
 
     def prime(self):
         """Clear any alarm triggers already in memory, and use the most recent
@@ -167,8 +164,8 @@ class IcalAlarmWatcher:
 
         # Go through the alarm queue and remove notifications that should
         # have been triggered some time ago
-        while self.alarm_queue and self.alarm_queue[-1][0] < datetime.now():
-            self.alarm_queue.pop()
+        while self.alarm_queue and self.alarm_queue[0][0] < datetime.now():
+            heapq.heappop(self.alarm_queue)
 
         if not self.alarm_queue:
             return
@@ -180,22 +177,16 @@ class IcalAlarmWatcher:
         # and then clears it from the queue
         def _notify_and_pop():
             notification.notify()
-            self.alarm_queue.pop()
+            heapq.heappop(self.alarm_queue)
 
         self.trigger = Trigger(timestamp, _notify_and_pop)
         self.trigger()
-
-        print(f'Setup alarm!\n\t{notification} @ {timestamp}')
-        print('Queue:\n\t' + '\n\t'.join(
-            map(lambda x: str(x[1]) + ' @ ' + str(x[0]), self.alarm_queue))
-        )
 
     @classmethod
     def get_subdirs(cls, path: Path) -> Generator[Path, None, None]:
         """Recursively list all directories under path"""
         for child in path.iterdir():
             if child.is_dir():
-                print(child)
                 yield child
                 yield from cls.get_subdirs(child)
 
